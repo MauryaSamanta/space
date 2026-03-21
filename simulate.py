@@ -26,13 +26,16 @@ def get_positions(satellites):
     return results
 
 
-def get_trajectory(sat, minutes=120, step=2):
+def get_trajectory(sat, minutes=120, step=0.25):
     s = Satrec.twoline2rv(sat["line1"], sat["line2"])
 
     now = datetime.datetime.utcnow()
     trajectory = []
 
-    for m in range(0, minutes, step):
+    steps = int(minutes / step)
+
+    for i in range(steps):
+        m = i * step
         t = now + datetime.timedelta(minutes=m)
 
         jd, fr = jday(

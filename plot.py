@@ -39,4 +39,4 @@ fig.add_trace(go.Surface(
     showscale=False
 ))
 
-fig.show()
+fig.write_html("orbit.html")
