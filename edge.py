@@ -1,7 +1,10 @@
 from fetch_tle import get_satellites
 from simulate import get_trajectory
 from collision import collision_probability
-
+from poliastro.iod import lambert
+from poliastro.bodies import Earth
+from astropy import units as u
+import numpy as np
 import math
 import datetime
 
@@ -22,6 +25,35 @@ def distance(p1, p2):
         (p1[2] - p2[2])**2
     )
 
+
+def lambert_transfer(oos_r, oos_v, target_r, tof):
+    try:
+        r1 = np.array(oos_r) * u.km
+        r2 = np.array(target_r) * u.km
+        tof = tof * u.s
+
+        (v1, v2), = lambert(Earth.k, r1, r2, tof)
+
+        v1 = v1.to(u.km / u.s).value
+
+        delta_v = np.linalg.norm(v1 - np.array(oos_v))
+
+        return {
+            "delta_v": delta_v,
+            "v1": v1
+        }
+
+    except Exception:
+        return None
+
+def compute_pair_pc(sat1, sat2, trajectories):
+    traj1 = trajectories[sat1]
+    traj2 = trajectories[sat2]
+
+    d, _, _ = closest_approach(traj1, traj2)
+    pc = collision_probability(d)
+
+    return d, pc
 
 # ---------- CLOSEST APPROACH ----------
 def closest_approach(traj1, traj2):
@@ -62,43 +94,63 @@ ACTIONS = [
 
 
 # ---------- ACTION EVALUATION ----------
-def evaluate_actions(sat_name, trajectories):
-    traj1 = trajectories[sat_name]
+def compute_best_maneuver(target, trajectories):
+    traj_target = trajectories[target]
 
-    original_risk = 0
-    for other, traj2 in trajectories.items():
-        if other == sat_name:
+    best_traj = None
+    best_pc = float("inf")
+    best_delta_v = None
+
+    for other, traj_other in trajectories.items():
+        if other == target:
             continue
-        d, _, _ = closest_approach(traj1, traj2)
-        original_risk += collision_probability(d)
 
-    best = None
-    best_score = float("inf")
+        # --- FIND TCA ---
+        min_dist, tca_idx, _ = closest_approach(traj_target, traj_other)
 
-    for action in ACTIONS:
-        new_traj = apply_action(traj1, action)
+        p1 = np.array(traj_target[tca_idx])
+        p2 = np.array(traj_other[tca_idx])
 
-        total_risk = 0
-        for other, traj2 in trajectories.items():
-            if other == sat_name:
-                continue
-            d, _, _ = closest_approach(new_traj, traj2)
-            total_risk += collision_probability(d)
+        # direction AWAY from collision
+        direction = p1 - p2
+        norm = np.linalg.norm(direction)
 
-        fuel = math.sqrt(sum(a*a for a in action)) * 300
-        risk_reduction = original_risk - total_risk
+        if norm == 0:
+            continue
 
-        score = 800 * total_risk - 2000 * risk_reduction + 0.1 * fuel
+        direction = direction / norm
 
-        if score < best_score:
-            best_score = score
-            best = {
-                "action": action,
-                "risk_reduction": risk_reduction
-            }
+        # --- TRY MULTIPLE ΔV SCALES ---
+        for scale in [0.005, 0.01, 0.02]:
+            # estimate velocity from trajectory
+            v_est = (np.array(traj_target[1]) - np.array(traj_target[0])) / DELTA_T
 
-    return best
+            delta_v = scale * direction
+            new_velocity = v_est + delta_v
 
+            # generate new trajectory
+            new_traj = []
+            for i in range(len(traj_target)):
+                new_traj.append(tuple(np.array(traj_target[i]) + delta_v * i * 10))
+
+            # --- EVALUATE RISK ---
+            total_pc = 0
+            for other2, traj_other2 in trajectories.items():
+                if other2 == target:
+                    continue
+
+                d, _, _ = closest_approach(new_traj, traj_other2)
+                total_pc += collision_probability(d)
+
+            if total_pc < best_pc:
+                best_pc = total_pc
+                best_traj = new_traj
+                best_delta_v = np.linalg.norm(delta_v)
+
+    return {
+        "trajectory": best_traj,
+        "delta_v": best_delta_v
+    }
 
 # ---------- BUILD TASK LIST ----------
 def build_tasks(trajectories):
@@ -141,10 +193,11 @@ def run_simulation():
 
     # OOS STATE
     oos = {
-        "position": trajectories[satellites[0]["name"]][0],
-        "busy_until": 0,
-        "fuel": 10000
-    }
+    "position": trajectories[satellites[0]["name"]][0],
+    "velocity": [0, 0, 0],  # initial approx
+    "busy_until": 0,
+    "fuel": 10000
+}
 
     cooldown = {}
 
@@ -177,21 +230,33 @@ def run_simulation():
             pos1 = trajectories[s1][0]
             pos2 = trajectories[s2][0]
 
-            t1 = estimate_rendezvous_time(oos["position"], pos1)
-            t2 = estimate_rendezvous_time(oos["position"], pos2)
+            # try both targets
+            for target, pos in [(s1, pos1), (s2, pos2)]:
 
-            if t1 < t2:
-                target = s1
-                t_r = t1
-                pos = pos1
-            else:
-                target = s2
-                t_r = t2
-                pos = pos2
+                # choose time of flight (important choice)
+                tof = min(t["t_collision"] * 0.5, 4000)  # cap for stability
 
-            total_time = t_r + DOCKING_TIME
+                result = lambert_transfer(
+                    oos["position"],
+                    oos["velocity"],
+                    pos,
+                    tof
+                )
 
-            if total_time < t["t_collision"]:
+                if result is None:
+                    continue
+
+                delta_v = result["delta_v"]
+
+                # feasibility check
+                if delta_v > oos["fuel"]:
+                    continue
+
+                total_time = tof + DOCKING_TIME
+
+                if total_time > t["t_collision"]:
+                    continue
+
                 # cooldown check
                 if target in cooldown and current_time < cooldown[target]:
                     continue
@@ -202,7 +267,8 @@ def run_simulation():
                     "target": target,
                     "Pc": t["Pc"],
                     "time_left": t["t_collision"],
-                    "rendezvous": t_r,
+                    "delta_v": delta_v,
+                    "tof": tof,
                     "pos": pos,
                     "priority": priority
                 })
@@ -220,21 +286,48 @@ def run_simulation():
         print(f"Pc: {best['Pc']:.4f}")
         print(f"Time Left: {best['time_left']:.2f}s")
 
-        action = evaluate_actions(target, trajectories)
+        result = compute_best_maneuver(target, trajectories)
 
-        print(f"Action: {action['action']}")
-        print(f"Risk Reduction: {action['risk_reduction']:.4f}")
+        if result["trajectory"] is None:
+            print("No valid maneuver found ❌")
+            current_time += DELTA_T
+            continue
+        satA = None
+        satB = None
 
-        # apply
-        trajectories[target] = apply_action(
-            trajectories[target],
-            action["action"]
-        )
+        # find the task corresponding to this target
+        for t in tasks:
+            if t["sat1"] == target or t["sat2"] == target:
+                satA = t["sat1"]
+                satB = t["sat2"]
+                break
 
+        # compute BEFORE
+        dist_before, pc_before = compute_pair_pc(satA, satB, trajectories)
+
+        print("\n--- BEFORE MANEUVER ---")
+        print(f"Pair: {satA} vs {satB}")
+        print(f"Min Distance: {dist_before:.2f} km")
+        print(f"Pc: {pc_before:.4f}")
+        # apply best maneuver
+        trajectories[target] = result["trajectory"]
+
+        print(f"Applied ΔV: {result['delta_v']:.6f}")
+        dist_after, pc_after = compute_pair_pc(satA, satB, trajectories)
+
+        print("\n--- AFTER MANEUVER ---")
+        print(f"Min Distance: {dist_after:.2f} km")
+        print(f"Pc: {pc_after:.4f}")
+
+        reduction = pc_before - pc_after
+
+        print("\n--- RESULT ---")
+        print(f"Risk Reduction: {reduction:.4f}")
         # update OOS
         oos["position"] = best["pos"]
-        oos["busy_until"] = current_time + best["rendezvous"] + DOCKING_TIME
-        oos["fuel"] -= 100
+        oos["velocity"] = [0, 0, 0]  # simplified for now
+        oos["busy_until"] = current_time + best["tof"] + DOCKING_TIME
+        oos["fuel"] -= best["delta_v"]
 
         # cooldown
         cooldown[target] = current_time + COOLDOWN_TIME
