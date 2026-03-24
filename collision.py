@@ -1,7 +1,7 @@
 # collision.py
 
 import math
-
+import numpy as np
 def distance(p1, p2):
     return math.sqrt(
         (p1[0] - p2[0])**2 +
@@ -27,6 +27,7 @@ def closest_approach(traj1, traj2):
     return min_dist, min_step, t_collision
 
 
-def collision_probability(distance, sigma=500):
-
-    return 1 / (1 + distance/200)
+def collision_probability(d):
+    if d > 5:
+        return 0.0
+    return np.exp(-d * 2)

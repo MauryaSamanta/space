@@ -8,6 +8,8 @@ import numpy as np
 import math
 import datetime
 
+from scenario_generator import generate_scenario
+
 # ---------- GLOBAL SETTINGS ----------
 STEP_MINUTES = 2
 DELTA_T = STEP_MINUTES * 60  # seconds
@@ -35,16 +37,29 @@ def lambert_transfer(oos_r, oos_v, target_r, tof):
         (v1, v2), = lambert(Earth.k, r1, r2, tof)
 
         v1 = v1.to(u.km / u.s).value
+        v2 = v2.to(u.km / u.s).value
 
         delta_v = np.linalg.norm(v1 - np.array(oos_v))
 
         return {
             "delta_v": delta_v,
-            "v1": v1
+            "v1": v1,
+            "v2": v2   # 👈 ADD THIS
         }
 
     except Exception:
         return None
+    
+def generate_oos_trajectory(start_pos, velocity, steps, dt):
+    traj = []
+    pos = np.array(start_pos)
+    vel = np.array(velocity)
+
+    for i in range(steps):
+        pos = pos + vel * dt
+        traj.append(tuple(pos))
+
+    return traj
 
 def compute_pair_pc(sat1, sat2, trajectories):
     traj1 = trajectories[sat1]
@@ -121,7 +136,7 @@ def compute_best_maneuver(target, trajectories):
         direction = direction / norm
 
         # --- TRY MULTIPLE ΔV SCALES ---
-        for scale in [0.005, 0.01, 0.02]:
+        for scale in [0.02, 0.05, 0.1]:
             # estimate velocity from trajectory
             v_est = (np.array(traj_target[1]) - np.array(traj_target[0])) / DELTA_T
 
@@ -131,7 +146,9 @@ def compute_best_maneuver(target, trajectories):
             # generate new trajectory
             new_traj = []
             for i in range(len(traj_target)):
-                new_traj.append(tuple(np.array(traj_target[i]) + delta_v * i * 10))
+                    dt = i * DELTA_T
+                    new_pos = np.array(traj_target[i]) + delta_v * dt
+                    new_traj.append(tuple(new_pos))
 
             # --- EVALUATE RISK ---
             total_pc = 0
@@ -156,56 +173,103 @@ def compute_best_maneuver(target, trajectories):
 def build_tasks(trajectories):
     tasks = []
 
-    names = list(trajectories.keys())
+    for name in trajectories.keys():
+        # only process real satellites
+        if "DEBRIS" in name:
+            continue
 
-    for i in range(len(names)):
-        for j in range(i+1, len(names)):
-            n1, n2 = names[i], names[j]
+        sat_name = name
+        debris_name = name + "_DEBRIS"
 
-            d, _, t_collision = closest_approach(
-                trajectories[n1],
-                trajectories[n2]
-            )
+        if debris_name not in trajectories:
+            continue
 
-            Pc = collision_probability(d)
+        traj_sat = trajectories[sat_name]
+        traj_debris = trajectories[debris_name]
 
-            tasks.append({
-                "sat1": n1,
-                "sat2": n2,
-                "Pc": Pc,
-                "t_collision": t_collision
-            })
+        d, _, t_collision = closest_approach(traj_sat, traj_debris)
+        Pc = collision_probability(d)
+
+        tasks.append({
+            "sat1": sat_name,
+            "sat2": debris_name,
+            "Pc": Pc,
+            "t_collision": t_collision
+        })
 
     return tasks
 
+def find_best_transfer_time(oos_pos, oos_vel, target_pos, t_collision):
+    candidate_tofs = np.linspace(300, t_collision * 0.8, 8)  # try multiple TOFs
+
+    best = None
+    best_dv = float("inf")
+
+    for tof in candidate_tofs:
+        result = lambert_transfer(oos_pos, oos_vel, target_pos, tof)
+
+        if result is None:
+            continue
+
+        delta_v = result["delta_v"]
+
+        if delta_v < best_dv:
+            best_dv = delta_v
+            best = {
+                "tof": tof,
+                "delta_v": delta_v,
+                "v1": result["v1"]
+            }
+
+    return best
 
 # ---------- MAIN SIMULATION ----------
 def run_simulation():
-    satellites = get_satellites(10)
+    # satellites = get_satellites(10)
 
     # FIXED START TIME (IMPORTANT)
     start_time = datetime.datetime.utcnow()
 
-    trajectories = {
-        sat["name"]: get_trajectory(sat)
-        for sat in satellites
-    }
+    # trajectories = {
+    #     sat["name"]: get_trajectory(sat)
+    #     for sat in satellites
+    # }
+    trajectories = generate_scenario(5)
 
     # OOS STATE
+    sat_names = [k for k in trajectories.keys() if "DEBRIS" not in k]
+
+    first_sat = sat_names[0]
+
     oos = {
-    "position": trajectories[satellites[0]["name"]][0],
-    "velocity": [0, 0, 0],  # initial approx
-    "busy_until": 0,
-    "fuel": 10000
-}
+        "position": trajectories[first_sat][0],
+        "velocity": [0, 0, 0],
+        "busy_until": 0,
+        "fuel": 10000
+    }
 
     cooldown = {}
 
     current_time = 0
 
-    for step in range(15):
-        print(f"\n========== STEP {step} ==========")
+    frames = []
 
+    for step in range(500):
+        print(f"\n========== STEP {step} ==========")
+        frame = {
+    "step": step,
+    "time": current_time,   # ADD THIS
+    "objects": {},
+    "oos": list(oos["position"]),
+    "events": [],
+    "status": "Idle"
+}
+
+        for name, traj in trajectories.items():
+            if step < len(traj):
+                frame["objects"][name] = traj[step]
+
+        frames.append(frame)
         # OOS busy check
         if current_time < oos["busy_until"]:
             print("OOS BUSY...")
@@ -215,7 +279,7 @@ def run_simulation():
         tasks = build_tasks(trajectories)
 
         # filter risky
-        tasks = [t for t in tasks if t["Pc"] > 0.2]
+        tasks = [t for t in tasks if t["Pc"] > 0.05]
 
         if not tasks:
             print("No high-risk collisions")
@@ -225,6 +289,14 @@ def run_simulation():
         feasible = []
 
         for t in tasks:
+            frame["events"].append({
+    "type": "conjunction",
+    "sat1": t["sat1"],
+    "sat2": t["sat2"],
+    "Pc": t["Pc"],
+    "tca": t["t_collision"],
+    "time_to_tca": t["t_collision"] - current_time
+})
             s1, s2 = t["sat1"], t["sat2"]
 
             pos1 = trajectories[s1][0]
@@ -234,19 +306,23 @@ def run_simulation():
             for target, pos in [(s1, pos1), (s2, pos2)]:
 
                 # choose time of flight (important choice)
-                tof = min(t["t_collision"] * 0.5, 4000)  # cap for stability
+                transfer = find_best_transfer_time(
+                oos["position"],
+                oos["velocity"],
+                pos,
+                t["t_collision"]
+            )
 
-                result = lambert_transfer(
-                    oos["position"],
-                    oos["velocity"],
-                    pos,
-                    tof
-                )
-
-                if result is None:
+                if transfer is None:
                     continue
 
-                delta_v = result["delta_v"]
+                tof = transfer["tof"]
+                delta_v = transfer["delta_v"]
+
+                # if result is None:
+                #     continue
+
+                # delta_v = result["delta_v"]
 
                 # feasibility check
                 if delta_v > oos["fuel"]:
@@ -280,8 +356,25 @@ def run_simulation():
 
         best = max(feasible, key=lambda x: x["priority"])
 
-        target = best["target"]
+        transfer = find_best_transfer_time(
+            oos["position"],
+            oos["velocity"],
+            best["pos"],
+            best["time_left"]
+        )
 
+        if transfer is None:
+            current_time += DELTA_T
+            continue
+
+        target = best["target"]
+        frame["status"] = "Maneuver"
+        frame["events"].append({
+            "type": "maneuver",
+            "target": target,
+            "Pc": best["Pc"],
+            "time_left": best["time_left"]
+        })
         print(f"TARGET: {target}")
         print(f"Pc: {best['Pc']:.4f}")
         print(f"Time Left: {best['time_left']:.2f}s")
@@ -324,8 +417,17 @@ def run_simulation():
         print("\n--- RESULT ---")
         print(f"Risk Reduction: {reduction:.4f}")
         # update OOS
-        oos["position"] = best["pos"]
-        oos["velocity"] = [0, 0, 0]  # simplified for now
+        steps = int(transfer["tof"] // DELTA_T)
+
+        oos_traj = generate_oos_trajectory(
+            oos["position"],
+            transfer["v1"],
+            steps,
+            DELTA_T
+        )
+
+        oos["trajectory"] = oos_traj
+        oos["traj_index"] = 0
         oos["busy_until"] = current_time + best["tof"] + DOCKING_TIME
         oos["fuel"] -= best["delta_v"]
 
@@ -334,8 +436,15 @@ def run_simulation():
 
         print(f"OOS BUSY UNTIL: {oos['busy_until']:.2f}")
         print(f"Fuel: {oos['fuel']}")
-
+        if "trajectory" in oos and oos["traj_index"] < len(oos["trajectory"]):
+            oos["position"] = oos["trajectory"][oos["traj_index"]]
+            oos["traj_index"] += 1
         current_time += DELTA_T
+       
+    import json
+
+    with open("../web/data.json", "w") as f:
+        json.dump(frames, f)
 
 
 # ---------- RUN ----------

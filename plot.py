@@ -1,172 +1,211 @@
-import plotly.graph_objects as go
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
 
-from fetch_tle import get_satellites
-from simulate import get_trajectory
-from collision import collision_probability
+from scenario_generator import generate_scenario
+from edge import (
+    build_tasks,
+    compute_best_maneuver,
+    compute_pair_pc,
+    find_best_transfer_time,
+    DELTA_T,
+    DOCKING_TIME,
+    COOLDOWN_TIME
+)
 
-from poliastro.iod import lambert
-from poliastro.bodies import Earth
-from poliastro.twobody.orbit import Orbit
-from astropy import units as u
+# -----------------------------
+# SETTINGS
+# -----------------------------
+STEPS = 200
 
-# ---------- LOAD ----------
-satellites = get_satellites(3)
+# -----------------------------
+# INIT SIMULATION
+# -----------------------------
+trajectories = generate_scenario(3)
 
-trajectories = {
-    sat["name"]: get_trajectory(sat)
-    for sat in satellites
+sat_names = [k for k in trajectories if "DEBRIS" not in k]
+first_sat = sat_names[0]
+
+oos = {
+    "position": np.array(trajectories[first_sat][0]),
+    "velocity": np.array([0, 0, 0]),
+    "busy_until": 0,
+    "fuel": 10000
 }
 
-# ---------- HELPERS ----------
-def closest_approach(traj1, traj2):
-    min_dist = float("inf")
-    min_idx = 0
+cooldown = {}
+current_time = 0
 
-    for i in range(min(len(traj1), len(traj2))):
-        d = np.linalg.norm(np.array(traj1[i]) - np.array(traj2[i]))
-        if d < min_dist:
-            min_dist = d
-            min_idx = i
+# -----------------------------
+# PLOT SETUP
+# -----------------------------
+fig = plt.figure(figsize=(8, 8))
+ax = fig.add_subplot(111, projection='3d')
 
-    return min_dist, min_idx
+ax.set_xlim(-9000, 9000)
+ax.set_ylim(-9000, 9000)
+ax.set_zlim(-9000, 9000)
 
-# ---------- FIND MOST RISKY PAIR ----------
-names = list(trajectories.keys())
+ax.set_title("OOS Collision Avoidance (REAL-TIME)")
 
-worst_pair = None
-worst_pc = 0
-
-for i in range(len(names)):
-    for j in range(i+1, len(names)):
-        n1, n2 = names[i], names[j]
-
-        d, _ = closest_approach(
-            trajectories[n1],
-            trajectories[n2]
-        )
-
-        pc = collision_probability(d)
-
-        if pc > worst_pc:
-            worst_pc = pc
-            worst_pair = (n1, n2)
-
-satA, satB = worst_pair
-
-trajA = trajectories[satA]
-trajB = trajectories[satB]
-
-# ---------- TCA ----------
-_, tca_idx = closest_approach(trajA, trajB)
-
-pA = np.array(trajA[tca_idx])
-pB = np.array(trajB[tca_idx])
-
-direction = pA - pB
-direction = direction / np.linalg.norm(direction)
-
-# ---------- APPLY SAME LOGIC AS SIMULATION ----------
-best_traj = None
-best_pc = float("inf")
-
-for scale in [0.005, 0.01, 0.02]:
-    new_traj = []
-
-    for i in range(len(trajA)):
-        new_traj.append(tuple(np.array(trajA[i]) + direction * scale * i * 10))
-
-    d, _ = closest_approach(new_traj, trajB)
-    pc = collision_probability(d)
-
-    if pc < best_pc:
-        best_pc = pc
-        best_traj = new_traj
-
-# ---------- LAMBERT (OPTIONAL OOS VISUAL) ----------
-r1 = trajA[0]
-r2 = trajB[0]
-
-def lambert_path(r1, r2, tof=5000):
-    r1 = np.array(r1) * u.km
-    r2 = np.array(r2) * u.km
-    tof = tof * u.s
-
-    (v1, v2), = lambert(Earth.k, r1, r2, tof)
-
-    orbit = Orbit.from_vectors(Earth, r1, v1)
-
-    ts = np.linspace(0, tof.value, 100) * u.s
-
-    pts = []
-    for t in ts:
-        pts.append(orbit.propagate(t).r.to(u.km).value)
-
-    return pts
-
-oos_path = lambert_path(r1, r2)
-
-# ---------- PLOT ----------
-fig = go.Figure()
-
-# all satellites
+# orbit lines
 for name, traj in trajectories.items():
-    fig.add_trace(go.Scatter3d(
-        x=[p[0] for p in traj],
-        y=[p[1] for p in traj],
-        z=[p[2] for p in traj],
-        mode='lines',
-        name=name,
-        opacity=0.3
-    ))
+    xs = [p[0] for p in traj]
+    ys = [p[1] for p in traj]
+    zs = [p[2] for p in traj]
 
-# highlight risky pair BEFORE
-fig.add_trace(go.Scatter3d(
-    x=[p[0] for p in trajA],
-    y=[p[1] for p in trajA],
-    z=[p[2] for p in trajA],
-    mode='lines',
-    name=f"{satA} (BEFORE)",
-    line=dict(width=6, dash='dash')
-))
+    if "DEBRIS" in name:
+        ax.plot(xs, ys, zs, 'r--', alpha=0.2)
+    else:
+        ax.plot(xs, ys, zs, 'b-', alpha=0.2)
 
-# AFTER maneuver
-fig.add_trace(go.Scatter3d(
-    x=[p[0] for p in best_traj],
-    y=[p[1] for p in best_traj],
-    z=[p[2] for p in best_traj],
-    mode='lines',
-    name=f"{satA} (AFTER)",
-    line=dict(width=6)
-))
+# dynamic points
+dots = {}
+for name in trajectories:
+    color = 'red' if "DEBRIS" in name else 'blue'
+    dot, = ax.plot([], [], [], 'o', color=color)
+    dots[name] = dot
 
-# other satellite
-fig.add_trace(go.Scatter3d(
-    x=[p[0] for p in trajB],
-    y=[p[1] for p in trajB],
-    z=[p[2] for p in trajB],
-    mode='lines',
-    name=f"{satB}"
-))
+# OOS
+oos_dot, = ax.plot([], [], [], 'go', markersize=8)
 
-# OOS path
-fig.add_trace(go.Scatter3d(
-    x=[p[0] for p in oos_path],
-    y=[p[1] for p in oos_path],
-    z=[p[2] for p in oos_path],
-    mode='lines',
-    name="OOS Path"
-))
+# text
+text = ax.text2D(0.02, 0.95, "", transform=ax.transAxes)
 
-# EARTH
-radius = 6371
-phi = np.linspace(0, np.pi, 50)
-theta = np.linspace(0, 2*np.pi, 50)
+# draw Earth
+u = np.linspace(0, 2*np.pi, 30)
+v = np.linspace(0, np.pi, 30)
 
-x = radius * np.outer(np.sin(phi), np.cos(theta))
-y = radius * np.outer(np.sin(phi), np.sin(theta))
-z = radius * np.outer(np.cos(phi), np.ones_like(theta))
+x = 6371 * np.outer(np.cos(u), np.sin(v))
+y = 6371 * np.outer(np.sin(u), np.sin(v))
+z = 6371 * np.outer(np.ones(np.size(u)), np.cos(v))
 
-fig.add_trace(go.Surface(x=x, y=y, z=z, opacity=0.4, showscale=False))
+ax.plot_surface(x, y, z, alpha=0.3)
 
-fig.write_html("real_simulation_visualization.html")
+# -----------------------------
+# UPDATE FUNCTION
+# -----------------------------
+def update(step):
+    global current_time, oos
+
+    # update satellite positions
+    for name, traj in trajectories.items():
+        if step < len(traj):
+            x, y, z = traj[step]
+            dots[name].set_data([x], [y])
+            dots[name].set_3d_properties([z])
+
+    # update OOS position
+    oos_dot.set_data([oos["position"][0]], [oos["position"][1]])
+    oos_dot.set_3d_properties([oos["position"][2]])
+
+    # ---------------- LOGIC ----------------
+    if current_time < oos["busy_until"]:
+        text.set_text("⏳ OOS BUSY")
+        current_time += DELTA_T
+        return
+
+    tasks = build_tasks(trajectories)
+    tasks = [t for t in tasks if t["Pc"] > 0.05]
+
+    if not tasks:
+        text.set_text("✅ No collision")
+        current_time += DELTA_T
+        return
+
+    feasible = []
+
+    for t in tasks:
+        for target in [t["sat1"], t["sat2"]]:
+            if "DEBRIS" in t["sat1"]:
+                target = t["sat2"]
+            else:
+                target = t["sat1"]
+            pos = trajectories[target][step]
+
+            transfer = find_best_transfer_time(
+                oos["position"],
+                oos["velocity"],
+                pos,
+                t["t_collision"]
+            )
+
+            if transfer is None:
+                continue
+
+            tof = transfer["tof"]
+            delta_v = transfer["delta_v"]
+
+            if delta_v > oos["fuel"]:
+                continue
+
+            if tof + DOCKING_TIME > t["t_collision"]:
+                continue
+
+            if target in cooldown and current_time < cooldown[target]:
+                continue
+
+            priority = t["Pc"] / (t["t_collision"] + 1e-6)
+
+            feasible.append({
+                "target": target,
+                "Pc": t["Pc"],
+                "tof": tof,
+                "delta_v": delta_v,
+                "priority": priority
+            })
+
+    if not feasible:
+        text.set_text("❌ No reachable")
+        current_time += DELTA_T
+        return
+
+    best = max(feasible, key=lambda x: x["priority"])
+    target = best["target"]
+
+    # BEFORE
+    satA = target
+    satB = target + "_DEBRIS"
+
+    dist_before, pc_before = compute_pair_pc(satA, satB, trajectories)
+
+    # APPLY MANEUVER
+    result = compute_best_maneuver(target, trajectories)
+
+    if result["trajectory"] is None:
+        text.set_text("❌ Maneuver failed")
+        current_time += DELTA_T
+        return
+
+    trajectories[target] = result["trajectory"]
+
+    dist_after, pc_after = compute_pair_pc(satA, satB, trajectories)
+
+    # update OOS
+    oos["position"] = np.array(trajectories[target][step])
+    oos["busy_until"] = current_time + best["tof"] + DOCKING_TIME
+    oos["fuel"] -= best["delta_v"]
+
+    cooldown[target] = current_time + COOLDOWN_TIME
+
+    text.set_text(
+        f"🚀 {target}\n"
+        f"Pc: {pc_before:.2f} → {pc_after:.2f}"
+    )
+
+    current_time += DELTA_T
+
+
+# -----------------------------
+# ANIMATION
+# -----------------------------
+ani = FuncAnimation(
+    fig,
+    update,
+    frames=STEPS,
+    interval=80,
+    repeat=True
+)
+
+plt.show()
