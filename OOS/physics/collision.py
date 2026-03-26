@@ -8,7 +8,7 @@ from physics.chan_probability import chan_collision_probability
 # -----------------------------
 # FIND TCA + RELATIVE STATE
 # -----------------------------
-def predict_tca_state(obj1, obj2, steps=200):
+def predict_tca_state(obj1, obj2, steps=500):
     r1, v1 = obj1["r"].copy(), obj1["v"].copy()
     r2, v2 = obj2["r"].copy(), obj2["v"].copy()
 
@@ -40,7 +40,7 @@ def get_default_covariance():
     100 meter uncertainty → 0.1 km
     convert to meters²
     """
-    sigma_m = 10.0  # meters
+    sigma_m = 50.0  # meters
     return np.eye(3) * (sigma_m ** 2)
 
 

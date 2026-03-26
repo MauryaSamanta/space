@@ -11,6 +11,8 @@ class OOS:
         self.fuel = 5.0
 
         self.dock_end_time = 0
+        self.current_mission = None
+        self.phase_direction = 0
 
     def propagate(self, rk4_step, dt):
         self.r, self.v = rk4_step(self.r, self.v, dt)

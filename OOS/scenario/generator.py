@@ -6,7 +6,7 @@ from config import DELTA_T, MU
 # -----------------------------
 # CREATE GUARANTEED COLLISION PAIR
 # -----------------------------
-def generate_collision_pair(name, back_steps=200):
+def generate_collision_pair(name, back_steps=500):
     """
     Create satellite + debris that WILL collide in future
     using backward propagation from collision point
@@ -41,19 +41,53 @@ def generate_collision_pair(name, back_steps=200):
 
 
 # -----------------------------
-# GENERATE FULL SCENARIO
+# GENERATE FULL SCENARIO (LEGACY)
 # -----------------------------
-def generate_scenario(n_satellites=3):
+# def generate_scenario(n_satellites=3):
+#     state = {}
+
+#     for i in range(n_satellites):
+#         pair = generate_collision_pair(f"SAT_{i}")
+
+#         # Directly store state (NO trajectory conversion)
+#         state.update(pair)
+
+#     return state
+
+def rotate_z(vec, theta):
+    R = np.array([
+        [np.cos(theta), -np.sin(theta), 0],
+        [np.sin(theta),  np.cos(theta), 0],
+        [0, 0, 1]
+    ])
+    return R @ vec
+
+
+def generate_orbit_cluster(n):
     state = {}
 
-    for i in range(n_satellites):
-        pair = generate_collision_pair(f"SAT_{i}")
+    for i in range(n):
+        name = f"SAT_{i}"
 
-        # Directly store state (NO trajectory conversion)
+        # generate collision-consistent pair
+        pair = generate_collision_pair(name)
+
+        # apply SAME rotation to both objects
+        theta = np.random.uniform(0, 2*np.pi)
+
+        pair[name]["r"] = rotate_z(pair[name]["r"], theta)
+        pair[name]["v"] = rotate_z(pair[name]["v"], theta)
+
+        pair[name + "_DEBRIS"]["r"] = rotate_z(pair[name + "_DEBRIS"]["r"], theta)
+        pair[name + "_DEBRIS"]["v"] = rotate_z(pair[name + "_DEBRIS"]["v"], theta)
+
+        # ✅ IMPORTANT: add to state
         state.update(pair)
 
     return state
 
+def generate_scenario(n_satellites=3):
+    return generate_orbit_cluster(n_satellites)
 
 # -----------------------------
 # DEBUG
