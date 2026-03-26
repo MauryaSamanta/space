@@ -1,5 +1,7 @@
 from scenario.generator import generate_scenario
 from oos.state import init_oos
+from oos.oos import OOS
+
 from physics.propagation import rk4_step
 from physics.collision import collision_probability
 from physics.lambert import find_best_transfer, lambert_transfer
@@ -67,8 +69,9 @@ def run_simulation():
     state = generate_scenario(3)
 
     first = list(state.keys())[0]
-    oos = init_oos(state[first]["r"])
-    oos["v"] = state[first]["v"].copy()
+    # oos = init_oos(state[first]["r"])
+    # oos["v"] = state[first]["v"].copy()
+    oos = OOS(state[first]["r"], state[first]["v"])
     current_time = 0
 
     for step in range(200):
@@ -80,14 +83,14 @@ def run_simulation():
             r_new, v_new = rk4_step(r, v, DELTA_T)
             state[name]["r"], state[name]["v"] = r_new, v_new
 
-        oos["r"], oos["v"] = rk4_step(oos["r"], oos["v"], DELTA_T)
+        oos.r, oos.v = rk4_step(oos.r, oos.v, DELTA_T)
 
         # ---------------- OOS STATE MACHINE ----------------
 
-        if oos["state"] == "PHASING":
-            target = oos["target"]
+        if oos.state == "PHASING":
+            target = oos.target
 
-            theta_oos = get_angle(oos["r"])
+            theta_oos = get_angle(oos.r)
             theta_target = get_angle(state[target]["r"])
 
             phase_error = theta_target - theta_oos
@@ -102,27 +105,27 @@ def run_simulation():
             dv = np.array([0.0, dv_mag, 0.0])
 
             if phase_error > 0:
-                oos["v"] += dv
+                oos.v += dv
             else:
-                oos["v"] -= dv
+                oos.v -= dv
 
-            oos["fuel"] -= np.linalg.norm(dv)
+            oos.fuel -= np.linalg.norm(dv)
 
             # check alignment
             if abs(phase_error) < 0.01:
                 print("✅ Phase aligned → Docking")
-                oos["state"] = "DOCKING"
-                oos["dock_end_time"] = current_time + DOCKING_TIME
+                oos.state = "DOCKING"
+                oos.dock_end_time = current_time + DOCKING_TIME
 
-        elif oos["state"] == "DOCKING":
-            print(f"→ Docking with {oos['target']}")
+        elif oos.state == "DOCKING":
+            print(f"→ Docking with {oos.target}")
 
-            if current_time >= oos["dock_end_time"]:
-                oos["state"] = "MANEUVER"
+            if current_time >= oos.dock_end_time:
+                oos.state = "MANEUVER"
                 print("✅ DOCKED → Executing maneuver")
 
-        elif oos["state"] == "MANEUVER":
-            target = oos["target"]
+        elif oos.state == "MANEUVER":
+            target = oos.target
             debris = target + "_DEBRIS"
 
             print("\n🚀 MANEUVER EXECUTION")
@@ -142,7 +145,7 @@ def run_simulation():
             state[target]["v"] += dv
 
             dv_mag = np.linalg.norm(dv)
-            oos["fuel"] -= dv_mag
+            oos.fuel -= dv_mag
 
             print("\n--- ΔV APPLIED ---")
             print(f"ΔV Magnitude: {dv_mag:.6f} km/s")
@@ -157,13 +160,13 @@ def run_simulation():
             print("\n--- RESULT ---")
             print(f"Risk Reduction: {pc_before - pc_after:.6f}")
 
-            oos["state"] = "IDLE"
-            oos["target"] = None
-            oos["planned_dv"] = None
+            oos.state = "IDLE"
+            oos.target = None
+            # oos["planned_dv"] = None
 
         # --------------------------------------------------
 
-        if oos["state"] != "IDLE":
+        if oos.state != "IDLE":
             current_time += DELTA_T
             continue
 
@@ -191,8 +194,8 @@ def run_simulation():
 
             tof = t_steps * DELTA_T
 
-            oos["state"] = "PHASING"
-            oos["target"] = sat
+            oos.state = "PHASING"
+            oos.target = sat
 
             print("\n🚀 MISSION STARTED (PHASING)")
             print(f"Target: {sat}")
