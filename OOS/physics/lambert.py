@@ -5,9 +5,9 @@ from astropy import units as u
 
 def find_best_transfer(oos, target_future_pos):
     best = None
-    best_cost = float("inf")
+    best_dv = float("inf")
 
-    for tof in [500, 1000, 2000, 3000, 4000]:
+    for tof in [2000, 3000, 4000, 6000, 8000]:
         transfer = lambert_transfer(
             oos["r"],
             oos["v"],
@@ -18,14 +18,15 @@ def find_best_transfer(oos, target_future_pos):
         if transfer is None:
             continue
 
-        dv = transfer["v1"] - oos["v"]
-        dv_mag = np.linalg.norm(dv)
+        dv = np.linalg.norm(transfer["v1"] - oos["v"])
 
-        if dv_mag < best_cost:
-            best_cost = dv_mag
+        if dv < best_dv:
+            best_dv = dv
             best = (transfer, tof)
 
     return best
+
+
 
 def lambert_transfer(r1, v1, r2, tof):
     try:

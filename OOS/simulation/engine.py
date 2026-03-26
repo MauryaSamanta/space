@@ -7,11 +7,12 @@ from config import *
 
 import numpy as np
 
-
+def get_angle(r):
+    return np.arctan2(r[1], r[0])
 # -----------------------------
 # 🔥 NEW: Predict TCA + future position
 # -----------------------------
-def predict_tca(obj1, obj2, steps=200):
+def predict_tca(obj1, obj2, steps=30):
     r1, v1 = obj1["r"].copy(), obj1["v"].copy()
     r2, v2 = obj2["r"].copy(), obj2["v"].copy()
 
@@ -67,7 +68,7 @@ def run_simulation():
 
     first = list(state.keys())[0]
     oos = init_oos(state[first]["r"])
-
+    oos["v"] = state[first]["v"].copy()
     current_time = 0
 
     for step in range(200):
@@ -83,12 +84,35 @@ def run_simulation():
 
         # ---------------- OOS STATE MACHINE ----------------
 
-        if oos["state"] == "TRANSIT":
-            print(f"→ Traveling to {oos['target']}")
+        if oos["state"] == "PHASING":
+            target = oos["target"]
 
-            if current_time >= oos["arrival_time"]:
+            theta_oos = get_angle(oos["r"])
+            theta_target = get_angle(state[target]["r"])
+
+            phase_error = theta_target - theta_oos
+
+            print(f"→ Phasing... error: {phase_error:.4f}")
+
+            # normalize angle
+            phase_error = (phase_error + np.pi) % (2 * np.pi) - np.pi
+
+            # small velocity tweak (phasing control)
+            dv_mag = 0.002 * phase_error   # proportional control
+            dv = np.array([0.0, dv_mag, 0.0])
+
+            if phase_error > 0:
+                oos["v"] += dv
+            else:
+                oos["v"] -= dv
+
+            oos["fuel"] -= np.linalg.norm(dv)
+
+            # check alignment
+            if abs(phase_error) < 0.01:
+                print("✅ Phase aligned → Docking")
                 oos["state"] = "DOCKING"
-                print("✅ ARRIVED → Docking...")
+                oos["dock_end_time"] = current_time + DOCKING_TIME
 
         elif oos["state"] == "DOCKING":
             print(f"→ Docking with {oos['target']}")
@@ -104,24 +128,27 @@ def run_simulation():
             print("\n🚀 MANEUVER EXECUTION")
 
             # BEFORE
-            d_before, _, _ = predict_tca(state[target], state[debris])
-            pc_before = collision_probability(d_before)
+            pc_before, d_before = collision_probability(state[target], state[debris])
 
             print("\n--- BEFORE ---")
             print(f"Min Distance: {d_before:.4f} km")
             print(f"Pc: {pc_before:.6f}")
 
             # APPLY ΔV
-            if oos["planned_dv"] is not None:
-                dv_mag = np.linalg.norm(oos["planned_dv"])
-                state[target]["v"] += oos["planned_dv"]
+            # push satellite slightly outward (radial burn)
+            direction = state[target]["r"] / np.linalg.norm(state[target]["r"])
+            dv = direction * 0.01   # 0.01 km/s (10 m/s)
 
-                print("\n--- ΔV APPLIED ---")
-                print(f"ΔV Magnitude: {dv_mag:.6f} km/s")
+            state[target]["v"] += dv
+
+            dv_mag = np.linalg.norm(dv)
+            oos["fuel"] -= dv_mag
+
+            print("\n--- ΔV APPLIED ---")
+            print(f"ΔV Magnitude: {dv_mag:.6f} km/s")
 
             # AFTER
-            d_after, _, _ = predict_tca(state[target], state[debris])
-            pc_after = collision_probability(d_after)
+            pc_after, d_after = collision_probability(state[target], state[debris])
 
             print("\n--- AFTER ---")
             print(f"Min Distance: {d_after:.4f} km")
@@ -148,12 +175,12 @@ def run_simulation():
 
             debris = sat + "_DEBRIS"
 
-            d, t_steps, target_future_pos = predict_tca(
+            Pc, d = collision_probability(state[sat], state[debris])
+
+            _, t_steps, target_future_pos = predict_tca(
                 state[sat],
                 state[debris]
             )
-
-            Pc = collision_probability(d)
 
             print(f"{sat} | d={d:.4f} km | Pc={Pc:.4f}")
 
@@ -164,27 +191,11 @@ def run_simulation():
 
             tof = t_steps * DELTA_T
 
-            transfer,tof = find_best_transfer(oos, target_future_pos)
-
-            if transfer is None:
-                print("❌ No valid transfer")
-                continue
-
-            dv = transfer["v1"] - oos["v"]
-            dv_mag = np.linalg.norm(dv)
-
-            print("\n🧠 TRANSFER FOUND")
-            print(f"TOF: {tof}")
-            print(f"ΔV: {dv_mag:.4f} km/s")
-
-            # schedule mission
-            oos["state"] = "TRANSIT"
+            oos["state"] = "PHASING"
             oos["target"] = sat
-            oos["arrival_time"] = current_time + tof
-            oos["dock_end_time"] = oos["arrival_time"] + DOCKING_TIME
-            oos["planned_dv"] = dv
 
-            print("\n🚀 MISSION SCHEDULED")
+            print("\n🚀 MISSION STARTED (PHASING)")
+            print(f"Target: {sat}")
 
             break
 

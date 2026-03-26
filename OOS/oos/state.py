@@ -2,14 +2,17 @@ import numpy as np
 
 def init_oos(initial_pos):
     return {
-        "r": np.array(initial_pos),
-        "v": np.array([0, 7.5, 0]),
+        "r": initial_pos.copy(),
+        "v": None,  # will be set later
 
         "state": "IDLE",
         "target": None,
 
-        "arrival_time": 0,
-        "dock_end_time": 0,
+        # 🔥 NEW
+        "phase_target_angle": None,
 
-        "planned_dv": None
+        "dock_end_time": 0,
+        "planned_dv": None,
+
+        "fuel": 5.0
     }
