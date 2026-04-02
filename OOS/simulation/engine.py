@@ -10,6 +10,7 @@ from config import *
 import numpy as np
 
 from oos.oos_mission_manager import assign_mission, generate_missions, prioritize_missions
+from scenario.generatorV2 import generate_scenario_v2
 
 def get_angle(r):
     return np.arctan2(r[1], r[0])
@@ -68,12 +69,15 @@ def find_valid_transfer(oos, target_future_pos, tof):
 # MAIN SIMULATION
 # -----------------------------
 def run_simulation():
-    state = generate_scenario(3)
+    state, base_i, base_raan = generate_scenario_v2(3)
 
     first = list(state.keys())[0]
     # oos = init_oos(state[first]["r"])
     # oos["v"] = state[first]["v"].copy()
-    oos = OOS(state[first]["r"], state[first]["v"])
+    r = state["SAT_0"]["r"] + 0.01
+    v = state["SAT_0"]["v"]
+    oos=OOS(r,v)
+
     current_time = 0
 
     for step in range(1200):
@@ -113,7 +117,7 @@ def run_simulation():
 
                 if assigned:
                     print("🚀 Mission started")
-                    oos.start_phasing(state, current_time)
+                    oos.start_mission(state, current_time)
                     
 
         current_time += DELTA_T
