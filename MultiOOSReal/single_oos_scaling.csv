@@ -1,0 +1,5 @@
+experiment_name,missions_total,missions_completed,collisions_avoided,missed_collisions,total_dv,fuel_used_total,avg_response_time,avg_dv_per_mission,success_rate
+1 OOS - 1 Sat,1,1,0,0,1.70E-05,1.70E-05,720,1.70E-05,1
+1 OOS - 2 Sats,2,1,0,0,11.18392065,11.18392065,720,5.591960323,0.5
+1 OOS - 3 Sats,3,1,0,0,11.1873183,11.1873183,720,5.59365915,0.333333333
+1 OOS - 4 Sats,2,0,0,0,375.5355834,375.5355834,0,187.7677917,0

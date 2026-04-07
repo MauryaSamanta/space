@@ -22,6 +22,9 @@ class OOS:
         self.transfer_end_time = None
         self.dock_end_time = None
         self.hold_end_time = None
+        self.match_start_time = None
+        
+        self.failed_sats = set()
 
     # =============================
     # MAIN STEP
@@ -30,6 +33,12 @@ class OOS:
 
         if self.state == "TRANSFER":
             self._handle_transfer(state, current_time)
+
+        elif self.state == "VEL_MATCH":
+            self._handle_velocity_match(state, current_time)
+
+        elif self.state == "DOCKING_PREP":
+            self._start_cw(state, current_time)
 
         elif self.state == "DOCKING":
             self._handle_docking(current_time)
@@ -56,13 +65,13 @@ class OOS:
 
         oos_state = {"r": self.r.copy(), "v": self.v.copy()}
 
-        # -------- CLOSE → CW --------
+        # CLOSE → CW
         if not is_far(oos_state, target_obj):
             print("🎯 Using CW (close target)")
             self._start_cw(state, current_time)
             return
 
-        # -------- FAR → LAMBERT --------
+        # FAR → LAMBERT
         print("🛰️ Using Lambert (far target)")
 
         transfer = lambert_transfer_safe(
@@ -74,7 +83,8 @@ class OOS:
 
         if transfer is None:
             print("❌ Lambert failed")
-            self._finish()
+            self.failed_sats.add(self.target)
+            self._finish(success=False)
             return
 
         dv = transfer["v1"] - self.v
@@ -84,36 +94,72 @@ class OOS:
         self.state = "TRANSFER"
 
     # =============================
-    # TRANSFER (NO LOOP NOW)
+    # TRANSFER
     # =============================
     def _handle_transfer(self, state, current_time):
         self._propagate()
 
-        target_obj = state[self.target]
-        dist = np.linalg.norm(self.r - target_obj["r"])
-
-        if dist < 200 or current_time >= self.transfer_end_time:
-            print("📍 Transfer complete → switching to CW")
-
-            self.transfer_end_time = None
-
-            # 🔥 DIRECTLY GO TO CW (NO PLANNING LOOP)
-            self._start_cw(state, current_time)
+        if current_time >= self.transfer_end_time:
+            print("📍 Transfer complete → starting velocity match")
+            self.state = "VEL_MATCH"
+            self.match_start_time = current_time
 
     # =============================
-    # CW START (CRITICAL FIX)
+    # VELOCITY MATCH (FIXED)
+    # =============================
+    def _handle_velocity_match(self, state, current_time):
+
+        self._propagate()
+
+        target_obj = state[self.target]
+
+        rel_v = self.v - target_obj["v"]
+        rel_v_mag = np.linalg.norm(rel_v)
+
+        print(f"🔧 Matching velocity | rel_v = {rel_v_mag:.3f}")
+
+        # SUCCESS
+        if rel_v_mag < 0.2:
+            print("✅ Velocity matched → CW")
+            self.state = "DOCKING_PREP"
+            return
+
+        # TIMEOUT (prevents infinite loop)
+        if current_time - self.match_start_time > 2000:
+            print("❌ Velocity match timeout")
+            self._finish(success=False)
+            return
+
+        # CONTROLLED DAMPING (CRITICAL FIX)
+        dv = -rel_v * 0.2
+        self._apply_dv(dv)
+
+    # =============================
+    # CW START
     # =============================
     def _start_cw(self, state, current_time):
         target_obj = state[self.target]
+
+        rel_v = np.linalg.norm(self.v - target_obj["v"])
+        dist = np.linalg.norm(self.r - target_obj["r"])
+
+        print(f"📏 Pre-CW | d={dist:.2f}, rel_v={rel_v:.3f}")
+
+        # SAFETY CHECK
+        if rel_v > 0.3:
+            print("❌ Too fast → back to velocity match")
+            self.state = "VEL_MATCH"
+            return
 
         print("🎯 Starting CW docking")
 
         oos_state = {"r": self.r.copy(), "v": self.v.copy()}
 
         dv = self._compute_best_cw(oos_state, target_obj)
+
         if dv is None:
             print("❌ CW failed")
-            self._finish()
+            self._finish(success=False)
             return
 
         self._apply_dv(dv)
@@ -127,9 +173,6 @@ class OOS:
     def _handle_docking(self, current_time):
         print(f"→ Docking with {self.target}")
 
-        if self.dock_end_time is None:
-            raise RuntimeError("dock_end_time not set")
-
         if current_time >= self.dock_end_time:
             print("✅ DOCKED → Executing maneuver")
             self.state = "MANEUVER"
@@ -138,13 +181,13 @@ class OOS:
     # MANEUVER
     # =============================
     def _handle_maneuver(self, state):
+
         target = self.target
         debris = target + "_DEBRIS"
 
         print("\n🚀 MANEUVER EXECUTION")
 
         pc, d = collision_probability(state[target], state[debris])
-
         print(f"Before → Pc: {pc:.6f}, d: {d:.4f}")
 
         if pc < 1e-4 and d > 1.0:
@@ -160,13 +203,17 @@ class OOS:
         print(f"After → Pc: {pc2:.6f}, d: {d2:.4f}")
         print(f"ΔV: {np.linalg.norm(dv):.6f}")
 
+        if hasattr(self, "metrics") and pc2 < 1e-5:
+            self.metrics.log_collision_avoided()
+
         self.state = "HOLD"
         self.hold_end_time = None
 
     # =============================
-    # HOLD (SMART CONTROL)
+    # HOLD
     # =============================
     def _handle_hold(self, state, current_time):
+
         target = self.target
         debris = target + "_DEBRIS"
 
@@ -174,17 +221,22 @@ class OOS:
 
         print(f"🟡 HOLD → Pc: {pc:.6f}, d: {d:.3f}")
 
-        if pc > 1e-4 or d < 1.0:
-            print("⚠️ Still risky → correcting again")
-            self.state = "MANEUVER"
+        if pc < 1e-6:
+            print("✅ Safe → leaving target")
+            self._finish()
             return
 
         if self.hold_end_time is None:
             self.hold_end_time = current_time + 500
 
         if current_time >= self.hold_end_time:
-            print("✅ Safe → leaving target")
+            print("✅ Timeout safe → leaving")
             self._finish()
+            return
+
+        if pc > 1e-4 or d < 1.0:
+            print("⚠️ Still risky → correcting")
+            self.state = "MANEUVER"
 
     # =============================
     # HELPERS
@@ -193,6 +245,9 @@ class OOS:
         self.v += dv
         self.fuel -= np.linalg.norm(dv)
 
+        if hasattr(self, "metrics"):
+            self.metrics.log_dv(dv)
+
     def _propagate(self):
         self.r, self.v = rk4_step(self.r, self.v, DELTA_T)
 
@@ -200,13 +255,21 @@ class OOS:
         best = None
         best_dv = float("inf")
 
-        for tof in range(1000, 3000, 200):
-            res = cw_transfer(oos_state, target_obj, tof)
-            if res["dv_mag"] < best_dv:
-                best_dv = res["dv_mag"]
-                best = res
+        for tof in np.arange(50, 2000, 20):
+            try:
+                res = cw_transfer(oos_state, target_obj, tof)
+                if res is not None and res["dv_mag"] < 5.0:
+                    if res["dv_mag"] < best_dv:
+                        best_dv = res["dv_mag"]
+                        best = res
+            except:
+                continue
 
-        return None if best is None else best["dv"]
+        if best is None:
+            print("❌ No CW solution")
+            return None
+
+        return best["dv"]
 
     def _compute_avoidance_dv(self, sat, debris):
         rel_v = sat["v"] - debris["v"]
@@ -220,20 +283,28 @@ class OOS:
         perp /= np.linalg.norm(perp)
 
         pc, _ = collision_probability(sat, debris)
-        dv_mag = min(0.1, pc)
+        dv_mag = max(0.01, min(0.1, pc))
+
+        print("Applying DV:", dv_mag)
 
         return perp * dv_mag
 
     # =============================
     # CLEANUP
     # =============================
-    def _finish(self):
+    def _finish(self, success=True):
+
         self.state = "IDLE"
         self.target = None
+
+        if hasattr(self, "metrics") and hasattr(self, "mission_start_time") and success:
+            response_time = self.current_time - self.mission_start_time
+            self.metrics.log_mission_complete(response_time)
 
         self.transfer_end_time = None
         self.dock_end_time = None
         self.hold_end_time = None
+        self.match_start_time = None
 
         if self.current_mission:
             self.current_mission.completed = True

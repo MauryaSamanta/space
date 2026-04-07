@@ -103,9 +103,10 @@ def run_simulation():
         # ---------------- MISSION SCHEDULING ----------------
 
         if oos.state == "IDLE":
-
+            
+            # missions = generate_missions(state, current_time, DELTA_T, oos.metrics)
             missions = generate_missions(state, current_time, DELTA_T)
-
+            missions = [m for m in missions if m.sat not in oos.failed_sats]
             if missions:
                 missions = prioritize_missions(missions)
 
