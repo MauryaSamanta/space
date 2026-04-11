@@ -1,138 +1,120 @@
-from scenario.generator import generate_scenario
-from oos.state import init_oos
-from oos.oos import OOS
-
-from physics.propagation import rk4_step
-from physics.collision import collision_probability
-from physics.lambert import find_best_transfer, lambert_transfer, predict_future
-from config import *
+"""
+main.py
+Multi-agent Orbital Servicing Simulation
+-----------------------------------------
+Architecture
+  * Fully decentralised — no ground station, no central planner
+  * Dominance-based coordination via INTENT broadcasts
+  * Realistic comms: Earth occlusion + distance-based delay
+  * Local sensing: each OOS perceives only objects within sensing_radius
+"""
 
 import numpy as np
 
-
 from scenario.generatorV2 import generate_scenario_v2
+from oos.oos import OOS
 from oos.network import Network
-
-def get_angle(r):
-    return np.arctan2(r[1], r[0])
-# -----------------------------
-# 🔥 NEW: Predict TCA + future position
-# -----------------------------
-def predict_tca(obj1, obj2, steps=500):
-    r1, v1 = obj1["r"].copy(), obj1["v"].copy()
-    r2, v2 = obj2["r"].copy(), obj2["v"].copy()
-
-    min_d = float("inf")
-    best_step = 0
-    best_r2 = None
-
-    for i in range(steps):
-        r1, v1 = rk4_step(r1, v1, DELTA_T)
-        r2, v2 = rk4_step(r2, v2, DELTA_T)
-
-        d = np.linalg.norm(r1 - r2)
-
-        if d < min_d:
-            min_d = d
-            best_step = i
-            best_r2 = r2.copy()
-
-    return min_d, best_step, best_r2
+from physics.propagation import rk4_step
+from config import DELTA_T
 
 
-# -----------------------------
-# 🔥 NEW: Find valid transfer using FUTURE position
-# -----------------------------
-def find_valid_transfer(oos, target_future_pos, tof):
-    try:
-        transfer = lambert_transfer(
-            oos["r"],
-            oos["v"],
-            target_future_pos,
-            tof
-        )
+# ── Simulation parameters ───────────────────────────────────────────────────
 
-        if transfer is None:
-            return None
-
-        # reject insane ΔV
-        dv = transfer["v1"] - oos["v"]
-        if np.linalg.norm(dv) > 10:
-            return None
-
-        return transfer
-
-    except:
-        return None
+N_SATELLITES    = 24        # number of sat/debris pairs
+N_AGENTS        = 6       # number of OOS spacecraft
+N_STEPS         = 1000    # total simulation ticks
+PROCESSING_DELAY = 0.1     # seconds of fixed processing delay in comms
+SENSING_RADIUS  = 5_000e3  # 5 000 km local perception radius (m)
+WAIT_DURATION   = 300.0    # seconds agents wait before committing to mission
 
 
-# -----------------------------
-# MAIN SIMULATION
-# -----------------------------
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _names_summary(env_state: dict) -> str:
+    """One-line summary of object positions for debug printing."""
+    parts = []
+    for name, obj in env_state.items():
+        alt_km = (np.linalg.norm(obj["r"]) - 6_371_000) / 1000
+        parts.append(f"{name}@{alt_km:.0f}km")
+    return "  ".join(parts)
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
 def run_simulation():
-    state, base_i, base_raan = generate_scenario_v2(3)
+    # ── Initialise environment ───────────────────────────────────────────────
+    env_state, base_inclination, base_raan = generate_scenario_v2(N_SATELLITES)
 
-    fleet = [
-        OOS(state["SAT_0"]["r"] + 0.01, state["SAT_0"]["v"], id=0),
-        OOS(state["SAT_1"]["r"] + 0.01, state["SAT_1"]["v"], id=1)
-    ]
+    print("=== SCENARIO GENERATED ===")
+    print(_names_summary(env_state))
 
-    network = Network(delay=200)
+    # ── Initialise fleet ─────────────────────────────────────────────────────
+    # Place each OOS just off the corresponding satellite to give distinct
+    # starting positions; fall back to SAT_0 if fewer sats than agents.
+    fleet: list[OOS] = []
+    sat_keys = [k for k in env_state if "DEBRIS" not in k]
 
-    WAIT_TIME = 300
-    current_time = 0
+    for i in range(N_AGENTS):
+        ref_key = sat_keys[i % len(sat_keys)]
+        ref_obj = env_state[ref_key]
+        offset  = np.array([10.0, 0.0, 0.0]) * (i + 1)   # small offset (m)
 
-    for step in range(1200):
+        agent = OOS(
+            r=ref_obj["r"] + offset,
+            v=ref_obj["v"].copy(),
+            id=i,
+            sensing_radius=SENSING_RADIUS,
+            wait_duration=WAIT_DURATION,
+        )
+        fleet.append(agent)
+        print(f"  OOS{i} spawned near {ref_key}")
 
-        print(f"\n================ STEP {step} ================")
+    # ── Initialise network ────────────────────────────────────────────────────
+    network = Network(processing_delay=PROCESSING_DELAY)
 
-        # -------- propagate --------
-        for name in state:
-            r, v = state[name]["r"], state[name]["v"]
-            state[name]["r"], state[name]["v"] = rk4_step(r, v, DELTA_T)
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    current_time = 0.0
+
+    
+
+    for step in range(N_STEPS):
+        # print(f"\n{'='*16} STEP {step:4d}  t={current_time:.0f}s {'='*16}")
+
+        # ── 1. Propagate all objects ────────────────────────────────────────
+        for name in env_state:
+            r, v = env_state[name]["r"], env_state[name]["v"]
+            env_state[name]["r"], env_state[name]["v"] = rk4_step(r, v, DELTA_T)
 
         for oos in fleet:
             oos.r, oos.v = rk4_step(oos.r, oos.v, DELTA_T)
 
-        # -------- deliver messages --------
-        network.deliver(current_time, fleet)
+        # ── 2. Deliver queued messages ──────────────────────────────────────
+        delivered = network.deliver(current_time, fleet)
+        # if delivered:
+            # print(f"  [NET] delivered {delivered} msg(s)  "
+                #   f"queue={network.queue_size}")
 
-        # -------- agent loop --------
+        # ── 3. Agent decision loop ──────────────────────────────────────────
         for oos in fleet:
-
-            oos.step(state, current_time)
-
-            # inbox update
-            oos.process_inbox()
-
-            # ---------------- CLAIM ----------------
-            if oos.state == "IDLE" and oos.pending_claim is None:
-
-                claim = oos.create_claim(state, current_time)
-
-                if claim:
-                    oos.pending_claim = claim
-                    oos.claim_time = current_time
-
-                    network.broadcast(claim, current_time)
-
-                    print(f"OOS{oos.id} CLAIM → {claim['mission_id']}")
-
-            # ---------------- WAIT + RESOLVE ----------------
-            if oos.pending_claim:
-
-                if current_time - oos.claim_time >= WAIT_TIME:
-
-                    if oos.resolve_claim():
-                        mission = oos.pending_claim["mission_id"]
-
-                        print(f"OOS{oos.id} START → {mission}")
-
-                        oos.target = mission
-                        oos.state = "PLANNING"
-                    else:
-                        print(f"OOS{oos.id} LOST → {oos.pending_claim['mission_id']}")
-
-                    oos.pending_claim = None
+            state_before = oos.state
+            oos.step(env_state, current_time, network, fleet)
+            if oos.state != state_before:
+                print(
+                    f"  OOS{oos.id}: {state_before} → {oos.state}"
+                    + (f" [{oos.target}]" if oos.target else "")
+                )
 
         current_time += DELTA_T
+
+    # ── Final report ─────────────────────────────────────────────────────────
+    print("\n=== SIMULATION COMPLETE ===")
+    for oos in fleet:
+        print(f"  OOS{oos.id}: final state = {oos.state}")
+
+    return fleet, env_state
+
+
+# ────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    run_simulation()

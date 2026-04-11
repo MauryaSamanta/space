@@ -6,7 +6,8 @@ class ExperimentConfig:
         n_satellites=3,
         n_orbits=1,
         fuel_per_oos=5.0,
-        steps=1000
+        steps=1000,
+        sensing_radius=5_000_000.0
     ):
         self.name = name
         self.n_oos = n_oos
@@ -14,3 +15,4 @@ class ExperimentConfig:
         self.n_orbits = n_orbits
         self.fuel_per_oos = fuel_per_oos
         self.steps = steps
+        self.sensing_radius=sensing_radius

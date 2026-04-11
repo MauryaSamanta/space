@@ -1,6 +1,7 @@
 from MetricsManager import MetricsManager
 import numpy as np
-
+from physics.collision import collision_probability
+from config import PC_THRESHOLD
 class ExperimentRunnerDistributed:
 
     def __init__(self, config):
@@ -17,16 +18,21 @@ class ExperimentRunnerDistributed:
 
         fleet = []
         sat_keys = [k for k in state if "_DEBRIS" not in k]
-        
+
         for i in range(self.config.n_oos):
 
             sat_name = sat_keys[i % len(sat_keys)]
             base = state[sat_name]
 
-            r = base["r"] + 0.01  # same as engine (NOT random noise)
+            r = base["r"] + 0.01
             v = base["v"]
 
-            oos = OOS(r, v, id=i)
+            oos = OOS(
+    r,
+    v,
+    id=i,
+    sensing_radius=self.config.sensing_radius
+)
             oos.metrics = self.metrics
             oos.fuel = self.config.fuel_per_oos
 
@@ -37,62 +43,57 @@ class ExperimentRunnerDistributed:
     def run(self):
         from physics.propagation import rk4_step
         from oos.network import Network
-
+        completed_targets = set()
+        active_collisions = set()
+        all_collisions = set()
         state, fleet = self.setup()
 
-        network = Network(delay=200)
-        WAIT_TIME = 300
+        network = Network(processing_delay=0.1)
 
         current_time = 0
 
         try:
             for step in range(self.config.steps):
 
-                # propagate env
+                # ── 1. propagate environment ─────────────────────
                 for name in state:
                     r, v = state[name]["r"], state[name]["v"]
                     state[name]["r"], state[name]["v"] = rk4_step(r, v, 120)
 
-                # propagate OOS
+                current_collisions = set()
+
+                for name in state:
+                    if "_DEBRIS" in name:
+                        sat = name.replace("_DEBRIS", "")
+
+                        pc, _ = collision_probability(state[sat], state[name])
+
+                        if pc >= PC_THRESHOLD:
+                            current_collisions.add(sat)
+                            all_collisions.add(sat)
+
+                # ── 2. propagate OOS ─────────────────────────────
                 for oos in fleet:
                     oos.r, oos.v = rk4_step(oos.r, oos.v, 120)
 
-                # deliver messages
+                # ── 3. deliver messages ──────────────────────────
                 network.deliver(current_time, fleet)
 
-                # agent loop
+                # ── 4. agent step ────────────────────────────────
                 for oos in fleet:
+                    oos.step(state, current_time, network, fleet, completed_targets, active_collisions)
 
-                    oos.current_time = current_time
-                    oos.step(state, current_time)
-
-                    oos.process_inbox()
-
-                    # CLAIM
-                    if oos.state == "IDLE" and oos.pending_claim is None:
-
-                        claim = oos.create_claim(state, current_time)
-
-                        if claim:
-                            oos.pending_claim = claim
-                            oos.claim_time = current_time
-
-                            network.broadcast(claim, current_time)
-
-                    # RESOLVE
-                    if oos.pending_claim:
-
-                        if current_time - oos.claim_time >= WAIT_TIME:
-
-                            if oos.resolve_claim():
-                                oos.target = oos.pending_claim["mission_id"]
-                                oos.state = "PLANNING"
-
-                            oos.pending_claim = None
+                # ❌ REMOVE THIS (already handled inside step)
+                # oos.process_inbox()
 
                 current_time += 120
 
         except KeyboardInterrupt:
-            print("\n⚠️ Interrupted during simulation — returning partial metrics...")
+            print("\n⚠️ Interrupted — returning partial metrics...")
 
-        return self.metrics.finalize()
+        result = self.metrics.finalize()
+
+        # 🔥 FIX TRUE NUMBER OF COLLISIONS
+        result["missions_total"] = len(all_collisions)
+
+        return result
